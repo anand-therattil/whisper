@@ -569,6 +569,44 @@ class DecodingTask:
                 )
             )
 
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+
+    # Clear KV cache more aggressively
+    def cleanup_memory(self):
+        self.inference.cleanup_caching()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _adaptive_temperature(self, logits, base_temp):
+        """Dynamically adjust temperature based on model confidence (entropy)"""
+        
+        if base_temp == 0:
+            return base_temp  # Keep deterministic decoding
+            
+        # Use numerically stable entropy calculation
+        log_probs = F.log_softmax(logits, dim=-1)
+        probs = F.softmax(logits, dim=-1)
+        
+        # Calculate entropy with numerical stability
+        entropy = -torch.sum(probs * log_probs, dim=-1)
+        
+        # Handle potential NaN/inf values
+        entropy = torch.clamp(entropy, min=1e-8, max=15.0)  # reasonable entropy bounds
+        
+        # Normalize entropy (typical range 0-15 for large vocabularies)
+        normalized_entropy = entropy / 15.0
+        confidence_factor = torch.exp(-normalized_entropy / 2.0)  # less aggressive scaling
+        
+        # Adaptive temperature: high entropy -> higher temp, low entropy -> lower temp
+        adaptive_temp = base_temp * (1.5 + 0.5 * normalized_entropy)  # range [base_temp * 1.5, base_temp * 2.0]
+        
+        # Ensure temperature stays within reasonable bounds
+        adaptive_temp = torch.clamp(adaptive_temp, min=0.01, max=2.0)
+        
+        return adaptive_temp
+
+    
     def _verify_options(self, options: DecodingOptions) -> DecodingOptions:
         if options.beam_size is not None and options.best_of is not None:
             raise ValueError("beam_size and best_of can't be given together")
@@ -698,16 +736,61 @@ class DecodingTask:
                 # apply the logit filters, e.g. for suppressing or applying penalty to
                 for logit_filter in self.logit_filters:
                     logit_filter.apply(logits, tokens)
-
-                # expand the tokens tensor with the selected next tokens
-                tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
+                
+                # Apply adaptive temperature BEFORE passing to decoder
+                if hasattr(self.decoder, 'temperature') and self.decoder.temperature > 0:
+                    adaptive_temps = self._adaptive_temperature(logits, self.decoder.temperature)
+                    
+                    # Check for NaN values before applying
+                    if torch.any(torch.isnan(adaptive_temps)) or torch.any(torch.isinf(adaptive_temps)):
+                        # Fallback to original temperature if adaptive calculation fails
+                        adaptive_temps = torch.full_like(adaptive_temps, self.decoder.temperature)
+                    
+                    # Apply temperature scaling properly
+                    # Instead of modifying logits directly, temporarily modify decoder temperature
+                    original_temp = self.decoder.temperature
+                    
+                    # For batch processing, we need to handle each sample separately
+                    if logits.shape[0] == 1:
+                        # Single sample case
+                        self.decoder.temperature = adaptive_temps.item()
+                        tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
+                        self.decoder.temperature = original_temp
+                    else:
+                        # Batch case - apply temperature per sample
+                        batch_tokens = []
+                        batch_completed = []
+                        
+                        for j in range(logits.shape[0]):
+                            sample_logits = logits[j:j+1]  # Keep batch dimension
+                            sample_tokens = tokens[j:j+1]
+                            sample_sum_logprobs = sum_logprobs[j:j+1]
+                            
+                            self.decoder.temperature = adaptive_temps[j].item()
+                            sample_tokens, sample_completed = self.decoder.update(
+                                sample_tokens, sample_logits, sample_sum_logprobs
+                            )
+                            
+                            batch_tokens.append(sample_tokens)
+                            batch_completed.append(sample_completed)
+                        
+                        # Reconstruct batch
+                        tokens = torch.cat(batch_tokens, dim=0)
+                        completed = all(batch_completed)
+                        self.decoder.temperature = original_temp
+                else:
+                    # No temperature adaptation
+                    tokens, completed = self.decoder.update(tokens, logits, sum_logprobs)
 
                 if completed or tokens.shape[-1] > self.n_ctx:
                     break
         finally:
-            self.inference.cleanup_caching()
+            self.cleanup_memory()
 
         return tokens, sum_logprobs, no_speech_probs
+
+
+        # return tokens, sum_logprobs, no_speech_probs
 
     @torch.no_grad()
     def run(self, mel: Tensor) -> List[DecodingResult]:
